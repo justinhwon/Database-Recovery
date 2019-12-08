@@ -111,7 +111,24 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public long commit(long transNum) {
         // TODO(hw5): implement
-        return -1L;
+
+        // get transactionTableEntry if exists
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        long prevLSN = transactionEntry.lastLSN;
+
+        // create the commit record
+        CommitTransactionLogRecord commitRecord = new CommitTransactionLogRecord(transNum, prevLSN);
+        long LSN = logManager.appendToLog(commitRecord);
+
+        // Update lastLSN of transaction table to commit record
+        transactionEntry.lastLSN = LSN;
+
+        // change transaction status to committing
+        transactionEntry.transaction.setStatus(Transaction.Status.COMMITTING);
+
+        // Flush log
+        logManager.flushToLSN(LSN);
+        return LSN;
     }
 
     /**
@@ -126,7 +143,23 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public long abort(long transNum) {
         // TODO(hw5): implement
-        return -1L;
+
+        // get transactionTableEntry if exists
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        long prevLSN = transactionEntry.lastLSN;
+
+        // create the abort record
+        AbortTransactionLogRecord abortRecord = new AbortTransactionLogRecord(transNum, prevLSN);
+        long LSN = logManager.appendToLog(abortRecord);
+
+        // Update lastLSN of transaction table to abort record
+        transactionEntry.lastLSN = LSN;
+
+        // change transaction status to aborting
+        transactionEntry.transaction.setStatus(Transaction.Status.ABORTING);
+
+        // Return abort record
+        return LSN;
     }
 
     /**
@@ -252,7 +285,7 @@ public class ARIESRecoveryManager implements RecoveryManager {
 
         }
 
-        // Update lastLSN of transaction and touched pages
+        // Update lastLSN of transaction table and touched pages
         transactionEntry.lastLSN = LSN;
         transactionEntry.touchedPages.add(pageNum);
 
