@@ -197,7 +197,67 @@ public class ARIESRecoveryManager implements RecoveryManager {
         assert (before.length == after.length);
 
         // TODO(hw5): implement
-        return -1L;
+
+        // get size of update (AFTER)
+        int updateSize = after.length;
+
+        // get transactionTableEntry if exists
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        long prevLSN = transactionEntry.lastLSN;
+
+        // check if page exists in dirtyPageTable by getting recLSN (page number -> recLSN).
+        Long recLSN = dirtyPageTable.get(pageNum);
+
+        // initialize return value/new lastLSN of transaction
+        long LSN;
+
+        // if update size too large, split into undo-only and redo-only update records
+        if (updateSize > (BufferManager.EFFECTIVE_PAGE_SIZE / 2)){
+
+            //initialize an empty array
+            byte[] emptyArray = new byte[0];
+
+            // first update sets bytes to nothing (undo only)
+            UpdatePageLogRecord undoOnlyRecord = new UpdatePageLogRecord(transNum, pageNum, prevLSN, pageOffset, before, emptyArray);
+
+            // add undo-only record to log
+            logManager.appendToLog(undoOnlyRecord);
+
+            // if page exists, no need to update dirty page table
+            // if page doesn't exist, need to update dirty page table
+            if(recLSN == null){
+                dirtyPageTable.put(pageNum, undoOnlyRecord.LSN);
+            }
+
+            // second update sets nothing to correct update (redo only)
+            UpdatePageLogRecord redoOnlyRecord = new UpdatePageLogRecord(transNum, pageNum, prevLSN, pageOffset, emptyArray, after);
+
+            // add redo-only record to log
+            LSN = logManager.appendToLog(redoOnlyRecord);
+
+        }
+        // otherwise just do one record
+        else{
+            // create update record if size fits
+            UpdatePageLogRecord updateRecord = new UpdatePageLogRecord(transNum, pageNum, prevLSN, pageOffset, before, after);
+
+            // add the new update record to log if size fits
+            LSN = logManager.appendToLog(updateRecord);
+
+            // if page exists, no need to update dirty page table
+            // if page doesn't exist, need to update dirty page table
+            if(recLSN == null){
+                dirtyPageTable.put(pageNum, updateRecord.LSN);
+            }
+
+        }
+
+        // Update lastLSN of transaction and touched pages
+        transactionEntry.lastLSN = LSN;
+        transactionEntry.touchedPages.add(pageNum);
+
+        //return LSN of latest log record added by this update
+        return LSN;
     }
 
     /**
