@@ -176,7 +176,79 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public long end(long transNum) {
         // TODO(hw5): implement
-        return -1L;
+
+        // get transactionTableEntry if exists
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        long prevLSN = transactionEntry.lastLSN;
+
+        // create new end record
+        EndTransactionLogRecord endRecord = new EndTransactionLogRecord(transNum, prevLSN);
+
+        // if aborting, undo transaction
+        if (transactionEntry.transaction.getStatus() == Transaction.Status.ABORTING){
+
+            // get the latest log in the chain
+            LogRecord prevLog = logManager.fetchLogRecord(prevLSN);
+
+            // undo if undoable until prevLSN == 0
+            while(prevLog.LSN != 0){
+
+                // if undoable, undo
+                if (prevLog.isUndoable()){
+                    // get CLR by passing lastLSN of transaction to undo method
+                    Pair<LogRecord, Boolean> clr = prevLog.undo(transactionEntry.lastLSN);
+
+                    // add undo-only record to log
+                    logManager.appendToLog(clr.getFirst());
+
+                    // undo the action in the record
+                    clr.getFirst().redo(diskSpaceManager, bufferManager);
+
+                    // Update lastLSN of transaction table
+                    transactionEntry.lastLSN = clr.getFirst().LSN;
+
+                    // get next LSN to undo
+                    Optional<Long> undoNextLSN = clr.getFirst().getUndoNextLSN();
+
+                    // set prevLog to that LSN if exists
+                    if(undoNextLSN.isPresent()){
+                        prevLog = logManager.fetchLogRecord(undoNextLSN.get());
+                    }
+                    // if prevLSN doesn't exist, stop undoing
+                    else{
+                        break;
+                    }
+                }
+                // otherwise just return next prevLog
+                else{
+                    if(prevLog.getPrevLSN().isPresent()){
+                        prevLog = logManager.fetchLogRecord(prevLog.getPrevLSN().get());
+                    }
+                    // if prevLSN doesn't exist, stop undoing
+                    else{
+                        break;
+                    }
+                }
+
+
+
+            }
+        }
+
+        // once ready to end, append end record to log
+        long LSN = logManager.appendToLog(endRecord);
+
+        // Update lastLSN of transaction table to end record
+        transactionEntry.lastLSN = LSN;
+
+        // change transaction status to complete
+        transactionEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+
+        // remove transaction from transaction table
+        transactionTable.remove(transNum);
+
+        // Return end record
+        return LSN;
     }
 
     /**
