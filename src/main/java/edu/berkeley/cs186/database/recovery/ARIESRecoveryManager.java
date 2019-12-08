@@ -629,6 +629,63 @@ public class ARIESRecoveryManager implements RecoveryManager {
 
         // TODO(hw5): generate end checkpoint record(s) for DPT and transaction table
 
+        // fill in the dirty page table entries for the checkpoint
+        for (Map.Entry<Long, Long> entry : dirtyPageTable.entrySet()){
+
+            // get key for dpt hashmap
+            Long pageNum = entry.getKey();
+            // get value for dpt hashmap
+            Long recLSN = entry.getValue();
+
+            // check if end checkpoint log record is full
+            boolean fitsAfterAdd;
+            fitsAfterAdd = EndCheckpointLogRecord.fitsInOneRecord(dpt.size(), txnTable.size()+1, touchedPages.size(), numTouchedPages);
+
+            // start new end checkpoint log record if full
+            if (!fitsAfterAdd) {
+                LogRecord endRecord = new EndCheckpointLogRecord(dpt, txnTable, touchedPages);
+                logManager.appendToLog(endRecord);
+
+                dpt.clear();
+                txnTable.clear();
+                touchedPages.clear();
+                numTouchedPages = 0;
+            }
+
+            // put pageNum, recLSN in dpt hashmap (for later input into checkpoint record)
+            dpt.put(pageNum, recLSN);
+
+        }
+
+
+        // fill in the transaction table entries for the checkpoint
+        for (Map.Entry<Long, TransactionTableEntry> entry : transactionTable.entrySet()) {
+            long transNum = entry.getKey();
+            TransactionTableEntry transactionEntry = entry.getValue();
+
+            // check if end checkpoint log record is full
+            boolean fitsAfterAdd;
+            fitsAfterAdd = EndCheckpointLogRecord.fitsInOneRecord(dpt.size(), txnTable.size()+1, touchedPages.size(), numTouchedPages);
+
+            // start new end checkpoint log record if full
+            if (!fitsAfterAdd) {
+                LogRecord endRecord = new EndCheckpointLogRecord(dpt, txnTable, touchedPages);
+                logManager.appendToLog(endRecord);
+
+                dpt.clear();
+                txnTable.clear();
+                touchedPages.clear();
+                numTouchedPages = 0;
+            }
+
+            // create pair of status, lastLSN
+            Pair<Transaction.Status, Long> pairStatusLastLSN = new Pair(transactionEntry.transaction.getStatus(), transactionEntry.lastLSN);
+            // put the pair into the txnTable map (for later input into checkpoint record)
+            txnTable.put(transNum, pairStatusLastLSN);
+        }
+
+        // below here is skeleton code
+
         for (Map.Entry<Long, TransactionTableEntry> entry : transactionTable.entrySet()) {
             long transNum = entry.getKey();
             for (long pageNum : entry.getValue().touchedPages) {
