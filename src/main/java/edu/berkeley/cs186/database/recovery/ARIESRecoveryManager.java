@@ -551,6 +551,55 @@ public class ARIESRecoveryManager implements RecoveryManager {
         long LSN = transactionEntry.getSavepoint(name);
 
         // TODO(hw5): implement
+
+        // get lastLSN of transactionTableEntry
+        long prevLSN = transactionEntry.lastLSN;
+
+
+        // get the latest log in the chain
+        LogRecord prevLog = logManager.fetchLogRecord(prevLSN);
+
+        // undo if undoable until prevLSN <= LSN from savePoint
+        while(prevLog.LSN > 0){
+
+            // if undoable, undo
+            if (prevLog.isUndoable()){
+                // get CLR by passing lastLSN of transaction to undo method
+                Pair<LogRecord, Boolean> clr = prevLog.undo(transactionEntry.lastLSN);
+
+                // add undo-only record to log
+                logManager.appendToLog(clr.getFirst());
+
+                // undo the action in the record
+                clr.getFirst().redo(diskSpaceManager, bufferManager);
+
+                // Update lastLSN of transaction table
+                transactionEntry.lastLSN = clr.getFirst().LSN;
+
+                // get next LSN to undo
+                Optional<Long> undoNextLSN = clr.getFirst().getUndoNextLSN();
+
+                // set prevLog to that LSN if exists
+                if(undoNextLSN.isPresent()){
+                    prevLog = logManager.fetchLogRecord(undoNextLSN.get());
+                }
+                // if prevLSN doesn't exist, stop undoing
+                else{
+                    break;
+                }
+            }
+            // otherwise just get next prevLog
+            else{
+                if(prevLog.getPrevLSN().isPresent()){
+                    prevLog = logManager.fetchLogRecord(prevLog.getPrevLSN().get());
+                }
+                // if prevLSN doesn't exist, stop undoing
+                else{
+                    break;
+                }
+            }
+        }
+
         return;
     }
 
