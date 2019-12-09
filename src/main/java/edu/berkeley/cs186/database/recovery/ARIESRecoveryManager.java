@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.function.BiConsumer;
 
 /**
  * Implementation of ARIES.
@@ -206,11 +207,13 @@ public class ARIESRecoveryManager implements RecoveryManager {
                         logManager.flushToLSN(clr.getFirst().LSN);
                     }
 
+                    // Update lastLSN of transaction table
+                    transactionEntry.lastLSN = clr.getFirst().LSN;
+
                     // undo the action in the record
                     clr.getFirst().redo(diskSpaceManager, bufferManager);
 
-                    // Update lastLSN of transaction table
-                    transactionEntry.lastLSN = clr.getFirst().LSN;
+
 
                     // get next LSN to undo
                     Optional<Long> undoNextLSN = clr.getFirst().getUndoNextLSN();
@@ -759,7 +762,30 @@ public class ARIESRecoveryManager implements RecoveryManager {
     @Override
     public Runnable restart() {
         // TODO(hw5): implement
-        return () -> {};
+
+        restartAnalysis();
+        restartRedo();
+
+        //clean the dirty page table of non-dirty pages (pages that aren't dirty in the buffer manager) between
+        //redo and undo, and perform a checkpoint after undo.
+
+        class CleanDPT implements BiConsumer<Long, Boolean> {
+            @Override
+            public void accept(Long pageNum, Boolean dirty) {
+                if (!dirty){
+                    dirtyPageTable.remove(pageNum);
+                }
+            }
+        }
+
+        // initialize the BiConsumer to put into iterPageNums
+        BiConsumer<Long, Boolean> cleaner = new CleanDPT();
+        bufferManager.iterPageNums(cleaner);
+
+        return () -> {
+            restartUndo();
+            checkpoint();
+        };
     }
 
     /**
@@ -1035,7 +1061,73 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     void restartRedo() {
         // TODO(hw5): implement
-        return;
+
+        // list of partition transaction operation types
+        Set<LogType> partTransOps = new HashSet<>();
+        partTransOps.add(LogType.ALLOC_PART);
+        partTransOps.add(LogType.FREE_PART);
+        partTransOps.add(LogType.UNDO_ALLOC_PART);
+        partTransOps.add(LogType.UNDO_FREE_PART);
+
+        // list of page transaction operation types
+        Set<LogType> pageTransOps = new HashSet<>();
+        pageTransOps.add(LogType.ALLOC_PAGE);
+        pageTransOps.add(LogType.UPDATE_PAGE);
+        pageTransOps.add(LogType.FREE_PAGE);
+        pageTransOps.add(LogType.UNDO_UPDATE_PAGE);
+        pageTransOps.add(LogType.UNDO_FREE_PAGE);
+        pageTransOps.add(LogType.UNDO_ALLOC_PAGE);
+
+        // get smallest recLSN from dirtyPageTable
+        Long leastRecLSN = Collections.min(dirtyPageTable.values());
+
+        // get log iterator
+        Iterator<LogRecord> logIter = logManager.scanFrom(leastRecLSN);
+
+        // while there are still logs
+        while(logIter.hasNext()){
+            // get the log record
+            LogRecord logRecord = logIter.next();
+            // get the log record transaction
+            TransactionTableEntry transactionEntry = transactionTable.get(logRecord.getTransNum().get());
+
+            // only redo if redoable
+            if(logRecord.isRedoable()){
+
+                // if about partition, just redo
+                if(partTransOps.contains(logRecord.type)){
+                    logRecord.redo(diskSpaceManager, bufferManager);
+                }
+
+                // if about page, check conditions
+                if(pageTransOps.contains(logRecord.type)){
+
+                    // page must be in the DPT
+                    boolean inDPT = dirtyPageTable.containsKey(logRecord.getPageNum().get());
+
+                    // the LSN is not less than the recLSN of the page, and
+                    boolean biggerRecLSN = (logRecord.LSN >= dirtyPageTable.get(logRecord.getPageNum().get()));
+
+                    // if fulfills both, get page and check if pageLSN okay
+                    if (inDPT && biggerRecLSN){
+
+                        // get the page from the bufferManager
+                        LockContext pageContext = getPageLockContext(logRecord.getPageNum().get());
+                        Page page = bufferManager.fetchPage(pageContext.parentContext(), logRecord.getPageNum().get(), false);
+
+                        // okay if the pageLSN on the page itself is strictly less than the LSN of the record.
+                        if(page.getPageLSN() < logRecord.LSN){
+                            logRecord.redo(diskSpaceManager, bufferManager);
+                        }
+
+                    }
+
+
+                }
+
+            }
+
+        }
     }
 
     /**
@@ -1051,10 +1143,125 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     void restartUndo() {
         // TODO(hw5): implement
+
+        // Creating empty priority queue
+        Comparator<Pair<Long, TransactionTableEntry>> comparator = new PairFirstReverseComparator<>();
+        PriorityQueue<Pair<Long, TransactionTableEntry>> pQueue = new PriorityQueue<Pair<Long, TransactionTableEntry>>(comparator);
+
+        //fill priority queue with all aborting transactions
+        for (Map.Entry<Long, TransactionTableEntry> entry : transactionTable.entrySet()){
+            if (entry.getValue().transaction.getStatus() == Transaction.Status.RECOVERY_ABORTING){
+                // sort queue by lastLSN of transaction
+                Pair<Long, TransactionTableEntry> pair = new Pair<Long, TransactionTableEntry>(entry.getValue().lastLSN, entry.getValue());
+                pQueue.add(pair);
+            }
+        }
+
+        // until all transactions finished
+        while(!pQueue.isEmpty()){
+            Pair<Long, TransactionTableEntry> transPair = pQueue.poll();
+
+            // if the record is undoable
+            LogRecord logRecord = logManager.fetchLogRecord(transPair.getFirst());
+            TransactionTableEntry transactionEntry = transPair.getSecond();
+            if (logRecord.isUndoable()){
+                //undo the record, emit appropriate CLR, update tables accordingly
+                // get CLR by passing lastLSN of transaction to undo method
+                Pair<LogRecord, Boolean> clr = logRecord.undo(transactionEntry.lastLSN);
+
+                // add undo-only record to log
+                logManager.appendToLog(clr.getFirst());
+
+                // Flush log if boolean is True
+                if(clr.getSecond()){
+                    logManager.flushToLSN(clr.getFirst().LSN);
+                }
+
+                // Update lastLSN of transaction table
+                transactionEntry.lastLSN = clr.getFirst().LSN;
+
+                // undo the action in the record
+                clr.getFirst().redo(diskSpaceManager, bufferManager);
+
+
+
+                //possibly update DPT???
+
+
+                //replace the LSN in the set with the undoNextLSN of the record if it has one, and the prevLSN otherwise;
+
+                // get next LSN to undo
+                Optional<Long> undoNextLSNOptional = clr.getFirst().getUndoNextLSN();
+                Long undoNextLSN;
+
+                // set prevLog to that LSN if exists
+                if(undoNextLSNOptional.isPresent()){
+                    undoNextLSN = undoNextLSNOptional.get();
+                }
+                else{
+                    undoNextLSN = logRecord.getPrevLSN().get();
+                }
+
+                //if the new LSN is 0, end the transaction and remove it from the queue and transaction table.
+                if(undoNextLSN == 0){
+
+                    transactionEntry.transaction.cleanup();
+                    // set transaction status to COMPLETE
+                    transactionEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+                    // write an end transaction record
+                    EndTransactionLogRecord endRecord = new EndTransactionLogRecord(transactionEntry.transaction.getTransNum(), transactionEntry.lastLSN);
+                    // once ready to end, append end record to log
+                    logManager.appendToLog(endRecord);
+                    // update lastLSN to endRecord
+                    transactionEntry.lastLSN = endRecord.LSN;
+                    // remove transaction from transaction table
+                    transactionTable.remove(transactionEntry.transaction.getTransNum());
+
+                }
+                else{
+                    // update priority queue for transaction
+                    Pair<Long, TransactionTableEntry> pair = new Pair<Long, TransactionTableEntry>(undoNextLSN, transactionEntry);
+                    pQueue.add(pair);
+                }
+
+            }
+            // if record is not undoable
+            else{
+
+                Long undoNextLSN = logRecord.getPrevLSN().get();
+                //Optional<Long> undoNextLSNOp = logRecord.getUndoNextLSN();
+
+                //if the new LSN is 0, end the transaction and remove it from the queue and transaction table.
+                if(undoNextLSN == 0){
+
+                    transactionEntry.transaction.cleanup();
+                    // set transaction status to COMPLETE
+                    transactionEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+                    // write an end transaction record
+                    EndTransactionLogRecord endRecord = new EndTransactionLogRecord(transactionEntry.transaction.getTransNum(), transactionEntry.lastLSN);
+                    // once ready to end, append end record to log
+                    logManager.appendToLog(endRecord);
+                    // update lastLSN to endRecord
+                    transactionEntry.lastLSN = endRecord.LSN;
+                    // remove transaction from transaction table
+                    transactionTable.remove(transactionEntry.transaction.getTransNum());
+
+                }
+                else{
+                    // update priority queue for transaction
+                    Pair<Long, TransactionTableEntry> pair = new Pair<Long, TransactionTableEntry>(undoNextLSN, transactionEntry);
+                    pQueue.add(pair);
+                }
+
+            }
+        }
+
+
         return;
     }
 
     // TODO(hw5): add any helper methods needed
+
 
     // Helpers ///////////////////////////////////////////////////////////////////////////////
 
